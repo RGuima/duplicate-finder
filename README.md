@@ -37,6 +37,14 @@ pip install -r requirements.txt
 python app.py
 ```
 
+Pass `--exact-only` to restrict the app to exact-duplicate matches only
+(similar/near-duplicate groups are not shown or scanned into results) and
+to enable the **Suggest Delete** bulk-cleanup button:
+
+```
+python app.py --exact-only
+```
+
 ## Usage
 
 1. Browse to (or type) the folder to scan.
@@ -66,3 +74,27 @@ or use the right-click menu). Safeguards:
 - A confirmation dialog names the exact file before anything happens.
 - A deleted file stays in the list, shown in red with strikethrough, until
   you rescan the folder — it isn't silently removed from view.
+
+## Suggest Delete (`--exact-only` mode)
+
+When launched with `--exact-only`, a **Suggest Delete** button appears.
+It targets exact-duplicate groups whose files all live in the same folder,
+and for each one picks a single file to remove: the one with the longest
+name, or — if names are the same length — the one that sorts last in
+natural (alphabetic + numeric) order. Groups spanning more than one folder,
+or where files live in different folders, are left alone.
+
+It's a two-step action:
+
+1. **First press** computes the suggestions and highlights every file that
+   would be deleted in orange, without touching disk. Review the
+   highlighted files in the list.
+2. **Second press** asks for confirmation (listing the files and total
+   size) and, only if you confirm, moves exactly those files to the
+   Recycle Bin. Declining the confirmation clears the highlight and
+   suggests nothing further until you press the button again.
+
+This is a separate action from the single-file **Delete File...** button
+and follows the same safety model: deletes go to the Recycle Bin via
+`send2trash`, and only one file per qualifying group is ever selected for
+removal, however many copies that group contains.
