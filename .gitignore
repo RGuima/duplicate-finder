@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.db
+*.db-wal
+*.db-shm
+_bulk_test*/
+_delete_test/
+_test_data/
