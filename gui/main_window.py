@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import threading
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QColor, QFont
+from PySide6.QtGui import QAction, QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QFileDialog, QProgressBar, QLabel, QTreeWidget, QTreeWidgetItem,
@@ -18,8 +19,19 @@ from scanner import engine
 from .detail_dialog import DetailDialog, _fmt_size, _fmt_time
 
 DELETED_COLOR = QColor("#c0392b")
+SUGGESTED_COLOR = QColor("#e67e22")
+NO_BACKGROUND = QBrush(Qt.BrushStyle.NoBrush)
 
 ROLE_ROW = Qt.ItemDataRole.UserRole
+
+
+def _natural_sort_key(name: str):
+    """Case-insensitive key that orders embedded digit runs numerically, so
+    e.g. 'file9' sorts before 'file10' the way a person would read them."""
+    return [
+        int(tok) if tok.isdigit() else tok.casefold()
+        for tok in re.split(r"(\d+)", name)
+    ]
 
 
 class ScanWorker(QThread):
@@ -53,14 +65,17 @@ STAGE_LABELS = {
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, exact_only: bool = False):
         super().__init__()
         self.setWindowTitle("Duplicate Finder")
         self.resize(1100, 700)
 
+        self.exact_only = exact_only
         self.current_root: str | None = None
         self.cancel_event = threading.Event()
         self.worker: ScanWorker | None = None
+        self.suggested_items: list[QTreeWidgetItem] = []
+        self.suggestion_armed = False
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -96,7 +111,11 @@ class MainWindow(QMainWindow):
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("Show:"))
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["All duplicates", "Exact duplicates only", "Similar only"])
+        if self.exact_only:
+            self.filter_combo.addItems(["Exact duplicates only"])
+            self.filter_combo.setEnabled(False)
+        else:
+            self.filter_combo.addItems(["All duplicates", "Exact duplicates only", "Similar only"])
         self.filter_combo.currentIndexChanged.connect(self.apply_filter)
         filter_row.addWidget(self.filter_combo)
         filter_row.addWidget(QLabel("Search:"))
@@ -129,10 +148,15 @@ class MainWindow(QMainWindow):
         self.open_btn.clicked.connect(self.open_selected_folder)
         self.delete_btn = QPushButton("Delete File...")
         self.delete_btn.clicked.connect(self.delete_selected_file)
+        self.suggest_btn = QPushButton("Suggest Delete")
+        self.suggest_btn.setVisible(self.exact_only)
+        self.suggest_btn.setEnabled(False)
+        self.suggest_btn.clicked.connect(self.on_suggest_delete_clicked)
         bottom_row.addWidget(self.summary_label, 1)
         bottom_row.addWidget(self.details_btn)
         bottom_row.addWidget(self.open_btn)
         bottom_row.addWidget(self.delete_btn)
+        bottom_row.addWidget(self.suggest_btn)
         layout.addLayout(bottom_row)
         self.update_action_buttons()
 
@@ -149,6 +173,10 @@ class MainWindow(QMainWindow):
             return
         self.current_root = root
         self.tree.clear()
+        self.suggested_items = []
+        self.suggestion_armed = False
+        self.suggest_btn.setText("Suggest Delete")
+        self.suggest_btn.setEnabled(False)
         self.update_action_buttons()
         self.summary_label.setText("")
         self.cancel_event = threading.Event()
@@ -191,17 +219,25 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Scan cancelled.")
             return
 
-        self.status_label.setText(
-            f"Scanned {result['total_files']:,} files. "
-            f"{result['exact_group_count']} exact-duplicate groups, "
-            f"{result['similar_group_count']} similar groups."
-        )
+        if self.exact_only:
+            self.status_label.setText(
+                f"Scanned {result['total_files']:,} files. "
+                f"{result['exact_group_count']} exact-duplicate groups."
+            )
+        else:
+            self.status_label.setText(
+                f"Scanned {result['total_files']:,} files. "
+                f"{result['exact_group_count']} exact-duplicate groups, "
+                f"{result['similar_group_count']} similar groups."
+            )
         self.populate_results()
 
     # ------------------------------------------------------------------
     def populate_results(self):
         self.tree.clear()
         groups = engine.get_results(self.current_root)
+        if self.exact_only:
+            groups = [g for g in groups if g.kind == "exact"]
         total_wasted = 0
         for group in groups:
             files = group.files
@@ -231,6 +267,10 @@ class MainWindow(QMainWindow):
         self.tree.expandAll()
         self.summary_label.setText(f"Estimated reclaimable space from exact duplicates: {_fmt_size(total_wasted)}")
         self.apply_filter()
+        self.suggested_items = []
+        self.suggestion_armed = False
+        self.suggest_btn.setText("Suggest Delete")
+        self.suggest_btn.setEnabled(self.exact_only)
         self.update_action_buttons()
 
     def apply_filter(self):
@@ -371,6 +411,116 @@ class MainWindow(QMainWindow):
             item.setFont(col, font)
         item.setText(0, f"{row['name']}  (deleted — rescan to refresh)")
         self.update_action_buttons()
+
+    # ------------------------------------------------------------------
+    # Suggest Delete: exact-only mode's bulk-cleanup action. Two presses:
+    # the first computes and highlights (in orange) one victim file per
+    # qualifying group, without touching disk; the second asks for
+    # confirmation and then deletes exactly those files.
+    def _compute_suggestions(self) -> list[QTreeWidgetItem]:
+        """One victim per exact-duplicate group that lives entirely in a
+        single folder: the file with the longest name, tie-broken by
+        natural alphabetic/numeric order (last wins)."""
+        victims = []
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            data = top.data(0, ROLE_ROW) or {}
+            if data.get("kind") != "exact":
+                continue
+            live_children = []
+            for j in range(top.childCount()):
+                child = top.child(j)
+                row = child.data(0, ROLE_ROW) or {}
+                if row and not row.get("deleted"):
+                    live_children.append(child)
+            if len(live_children) < 2:
+                continue
+            dirs = {child.data(0, ROLE_ROW)["dir"] for child in live_children}
+            if len(dirs) != 1:
+                continue
+            victim = max(
+                live_children,
+                key=lambda c: (
+                    len(c.data(0, ROLE_ROW)["name"]),
+                    _natural_sort_key(c.data(0, ROLE_ROW)["name"]),
+                ),
+            )
+            victims.append(victim)
+        return victims
+
+    def _clear_suggestion_highlight(self):
+        for item in self.suggested_items:
+            row = item.data(0, ROLE_ROW) or {}
+            if row.get("deleted"):
+                continue
+            for col in range(self.tree.columnCount()):
+                item.setBackground(col, NO_BACKGROUND)
+        self.suggested_items = []
+        self.suggestion_armed = False
+        self.suggest_btn.setText("Suggest Delete")
+
+    def on_suggest_delete_clicked(self):
+        if not self.suggestion_armed:
+            victims = self._compute_suggestions()
+            if not victims:
+                QMessageBox.information(
+                    self,
+                    "Suggest Delete",
+                    "No exact-duplicate group is fully contained in a single folder.",
+                )
+                return
+            self.suggested_items = victims
+            for item in victims:
+                for col in range(self.tree.columnCount()):
+                    item.setBackground(col, SUGGESTED_COLOR)
+            self.suggestion_armed = True
+            self.suggest_btn.setText(f"Confirm Delete ({len(victims)})")
+            return
+
+        victims = self.suggested_items
+        total_size = sum((v.data(0, ROLE_ROW) or {}).get("size", 0) for v in victims)
+        preview_paths = [(v.data(0, ROLE_ROW) or {}).get("path", "") for v in victims[:20]]
+        preview = "\n".join(preview_paths)
+        if len(victims) > 20:
+            preview += f"\n... and {len(victims) - 20} more"
+        confirm = QMessageBox.question(
+            self,
+            "Confirm suggested deletions",
+            f"Move {len(victims)} file(s) to the Recycle Bin? "
+            f"Total size: {_fmt_size(total_size)}\n\n{preview}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            self._clear_suggestion_highlight()
+            return
+
+        errors = []
+        for item in victims:
+            row = item.data(0, ROLE_ROW)
+            if not row or row.get("deleted"):
+                continue
+            try:
+                send2trash(row["path"])
+            except Exception as e:
+                errors.append(f"{row['path']}: {e}")
+                continue
+            row["deleted"] = True
+            item.setData(0, ROLE_ROW, row)
+            font = item.font(0)
+            font.setStrikeOut(True)
+            for col in range(self.tree.columnCount()):
+                item.setBackground(col, NO_BACKGROUND)
+                item.setForeground(col, DELETED_COLOR)
+                item.setFont(col, font)
+            item.setText(0, f"{row['name']}  (deleted — rescan to refresh)")
+
+        self.suggested_items = []
+        self.suggestion_armed = False
+        self.suggest_btn.setText("Suggest Delete")
+        self.update_action_buttons()
+        if errors:
+            QMessageBox.warning(self, "Some deletions failed", "\n".join(errors))
 
     def show_context_menu(self, pos):
         item = self.tree.itemAt(pos)
