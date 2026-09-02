@@ -6,17 +6,18 @@ import subprocess
 import threading
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QFont
+from PySide6.QtGui import QAction, QBrush, QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QFileDialog, QProgressBar, QLabel, QTreeWidget, QTreeWidgetItem,
-    QComboBox, QMenu, QMessageBox, QSplitter, QTreeWidgetItemIterator,
-    QAbstractItemView,
+    QMenu, QMessageBox, QDialog, QAbstractItemView,
 )
 from send2trash import send2trash
 
 from scanner import engine
+from scanner import db as dbmod
 from .detail_dialog import DetailDialog, _fmt_size, _fmt_time
+from .priority_dialog import FolderPriorityDialog
 
 DELETED_COLOR = QColor("#c0392b")
 SUGGESTED_COLOR = QColor("#e67e22")
@@ -32,6 +33,25 @@ def _natural_sort_key(name: str):
         int(tok) if tok.isdigit() else tok.casefold()
         for tok in re.split(r"(\d+)", name)
     ]
+
+
+def _resolve_rank(folder: str, rules: list[tuple[str, bool, int]]) -> float:
+    """The priority rank for a folder: an exact rule always wins; otherwise
+    the most specific ancestor folder marked 'include subfolders' applies;
+    otherwise the folder is unranked (worst priority)."""
+    norm_folder = os.path.normcase(os.path.normpath(folder))
+    best_rank = None
+    best_specificity = -1
+    for path, recursive, rank in rules:
+        norm_rule = os.path.normcase(os.path.normpath(path))
+        if norm_folder == norm_rule:
+            return rank
+        if recursive and norm_folder.startswith(norm_rule + os.sep):
+            specificity = len(norm_rule)
+            if specificity > best_specificity:
+                best_specificity = specificity
+                best_rank = rank
+    return best_rank if best_rank is not None else float("inf")
 
 
 class ScanWorker(QThread):
@@ -59,18 +79,16 @@ STAGE_LABELS = {
     "walk": "Scanning files",
     "partial_hash": "Comparing sizes",
     "full_hash": "Hashing candidates",
-    "metadata": "Reading attributes (EXIF/doc info)",
     "done": "Done",
 }
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, exact_only: bool = False):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle("Duplicate Finder")
         self.resize(1100, 700)
 
-        self.exact_only = exact_only
         self.current_root: str | None = None
         self.cancel_event = threading.Event()
         self.worker: ScanWorker | None = None
@@ -109,15 +127,6 @@ class MainWindow(QMainWindow):
 
         # --- filter row ---
         filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Show:"))
-        self.filter_combo = QComboBox()
-        if self.exact_only:
-            self.filter_combo.addItems(["Exact duplicates only"])
-            self.filter_combo.setEnabled(False)
-        else:
-            self.filter_combo.addItems(["All duplicates", "Exact duplicates only", "Similar only"])
-        self.filter_combo.currentIndexChanged.connect(self.apply_filter)
-        filter_row.addWidget(self.filter_combo)
         filter_row.addWidget(QLabel("Search:"))
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Filter by name or path...")
@@ -149,7 +158,6 @@ class MainWindow(QMainWindow):
         self.delete_btn = QPushButton("Delete File...")
         self.delete_btn.clicked.connect(self.delete_selected_file)
         self.suggest_btn = QPushButton("Suggest Delete")
-        self.suggest_btn.setVisible(self.exact_only)
         self.suggest_btn.setEnabled(False)
         self.suggest_btn.clicked.connect(self.on_suggest_delete_clicked)
         bottom_row.addWidget(self.summary_label, 1)
@@ -219,36 +227,23 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Scan cancelled.")
             return
 
-        if self.exact_only:
-            self.status_label.setText(
-                f"Scanned {result['total_files']:,} files. "
-                f"{result['exact_group_count']} exact-duplicate groups."
-            )
-        else:
-            self.status_label.setText(
-                f"Scanned {result['total_files']:,} files. "
-                f"{result['exact_group_count']} exact-duplicate groups, "
-                f"{result['similar_group_count']} similar groups."
-            )
+        self.status_label.setText(
+            f"Scanned {result['total_files']:,} files. "
+            f"{result['exact_group_count']} exact-duplicate groups."
+        )
         self.populate_results()
 
     # ------------------------------------------------------------------
     def populate_results(self):
         self.tree.clear()
         groups = engine.get_results(self.current_root)
-        if self.exact_only:
-            groups = [g for g in groups if g.kind == "exact"]
         total_wasted = 0
         for group in groups:
             files = group.files
             rep_size = files[0]["size"]
-            if group.kind == "exact":
-                header = f"Exact duplicates — {len(files)} files, {_fmt_size(rep_size)} each"
-                total_wasted += rep_size * (len(files) - 1)
-            else:
-                header = f"Similar ({group.category}) — {len(files)} files"
+            header = f"Exact duplicates — {len(files)} files, {_fmt_size(rep_size)} each"
+            total_wasted += rep_size * (len(files) - 1)
             top = QTreeWidgetItem([header, "", "", ""])
-            top.setData(0, ROLE_ROW, {"kind": group.kind})
             font = top.font(0)
             font.setBold(True)
             top.setFont(0, font)
@@ -265,33 +260,25 @@ class MainWindow(QMainWindow):
                 top.addChild(child)
             self.tree.addTopLevelItem(top)
         self.tree.expandAll()
-        self.summary_label.setText(f"Estimated reclaimable space from exact duplicates: {_fmt_size(total_wasted)}")
+        self.summary_label.setText(f"Estimated reclaimable space: {_fmt_size(total_wasted)}")
         self.apply_filter()
         self.suggested_items = []
         self.suggestion_armed = False
         self.suggest_btn.setText("Suggest Delete")
-        self.suggest_btn.setEnabled(self.exact_only)
+        self.suggest_btn.setEnabled(self.tree.topLevelItemCount() > 0)
         self.update_action_buttons()
 
     def apply_filter(self):
-        mode = self.filter_combo.currentText()
         search = self.search_edit.text().strip().lower()
 
         for i in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(i)
-            data = top.data(0, ROLE_ROW) or {}
-            kind = data.get("kind")
-            kind_ok = (
-                mode == "All duplicates"
-                or (mode == "Exact duplicates only" and kind == "exact")
-                or (mode == "Similar only" and kind == "similar")
-            )
             any_child_visible = False
             for j in range(top.childCount()):
                 child = top.child(j)
                 row = child.data(0, ROLE_ROW) or {}
                 text = f"{row.get('name', '')} {row.get('path', row.get('dir', ''))}".lower()
-                visible = kind_ok and (not search or search in text)
+                visible = not search or search in text
                 child.setHidden(not visible)
                 any_child_visible = any_child_visible or visible
             top.setHidden(not any_child_visible)
@@ -413,39 +400,65 @@ class MainWindow(QMainWindow):
         self.update_action_buttons()
 
     # ------------------------------------------------------------------
-    # Suggest Delete: exact-only mode's bulk-cleanup action. Two presses:
-    # the first computes and highlights (in orange) one victim file per
-    # qualifying group, without touching disk; the second asks for
-    # confirmation and then deletes exactly those files.
-    def _compute_suggestions(self) -> list[QTreeWidgetItem]:
-        """One victim per exact-duplicate group that lives entirely in a
-        single folder: the file with the longest name, tie-broken by
-        natural alphabetic/numeric order (last wins)."""
+    # Suggest Delete: a folder-priority-driven bulk-cleanup action.
+    #
+    # First press: gather every folder that holds a file in some
+    # exact-duplicate group, let the user rank those folders (most
+    # important first) in the Set Folder Priority dialog, then compute and
+    # highlight (in orange) which file in each group would be removed --
+    # no disk changes yet. Second press asks for confirmation and only
+    # then deletes exactly those files.
+    #
+    # Per group: the file(s) in the highest-ranked folder are kept; every
+    # file in a lower-ranked folder is suggested for removal. If two or
+    # more files tie for the top rank (e.g. they're already in the same
+    # folder), only one of them -- the longest name, natural-sort-last on
+    # ties -- is added to the suggestion, so exactly one keeper survives.
+    # Folders with no ranking at all are treated as tied with each other,
+    # which reduces to "pick one file to remove from the group" when no
+    # priority has been set.
+    def _distinct_live_folders(self) -> list[str]:
+        folders = set()
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            live = [
+                top.child(j) for j in range(top.childCount())
+                if not (top.child(j).data(0, ROLE_ROW) or {}).get("deleted")
+            ]
+            if len(live) < 2:
+                continue
+            for child in live:
+                folders.add(child.data(0, ROLE_ROW)["dir"])
+        return sorted(folders)
+
+    def _compute_suggestions(self, rules: list[tuple[str, bool, int]]) -> list[QTreeWidgetItem]:
         victims = []
         for i in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(i)
-            data = top.data(0, ROLE_ROW) or {}
-            if data.get("kind") != "exact":
-                continue
-            live_children = []
-            for j in range(top.childCount()):
-                child = top.child(j)
-                row = child.data(0, ROLE_ROW) or {}
-                if row and not row.get("deleted"):
-                    live_children.append(child)
+            live_children = [
+                top.child(j) for j in range(top.childCount())
+                if (top.child(j).data(0, ROLE_ROW) or {}).get("path")
+                and not (top.child(j).data(0, ROLE_ROW) or {}).get("deleted")
+            ]
             if len(live_children) < 2:
                 continue
-            dirs = {child.data(0, ROLE_ROW)["dir"] for child in live_children}
-            if len(dirs) != 1:
-                continue
-            victim = max(
-                live_children,
-                key=lambda c: (
-                    len(c.data(0, ROLE_ROW)["name"]),
-                    _natural_sort_key(c.data(0, ROLE_ROW)["name"]),
-                ),
-            )
-            victims.append(victim)
+            ranked = [
+                (child, _resolve_rank(child.data(0, ROLE_ROW)["dir"], rules))
+                for child in live_children
+            ]
+            top_rank = min(r for _, r in ranked)
+            top_tier = [c for c, r in ranked if r == top_rank]
+            lower_tier = [c for c, r in ranked if r != top_rank]
+            victims.extend(lower_tier)
+            if len(top_tier) > 1:
+                victim = max(
+                    top_tier,
+                    key=lambda c: (
+                        len(c.data(0, ROLE_ROW)["name"]),
+                        _natural_sort_key(c.data(0, ROLE_ROW)["name"]),
+                    ),
+                )
+                victims.append(victim)
         return victims
 
     def _clear_suggestion_highlight(self):
@@ -461,12 +474,45 @@ class MainWindow(QMainWindow):
 
     def on_suggest_delete_clicked(self):
         if not self.suggestion_armed:
-            victims = self._compute_suggestions()
+            folders = self._distinct_live_folders()
+            if not folders:
+                QMessageBox.information(self, "Suggest Delete", "No duplicate groups to act on.")
+                return
+
+            conn = dbmod.connect(dbmod.default_db_path())
+            cached = {
+                path: (recursive, rank)
+                for path, recursive, rank in dbmod.get_all_folder_priorities(conn)
+            }
+
+            def sort_key(folder):
+                if folder in cached:
+                    return (0, cached[folder][1])
+                return (1, folder.casefold())
+
+            prefill = [
+                (folder, cached[folder][0] if folder in cached else False)
+                for folder in sorted(folders, key=sort_key)
+            ]
+
+            dialog = FolderPriorityDialog(prefill, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                conn.close()
+                return
+
+            entries = dialog.ordered_result()
+            dbmod.save_folder_priorities(
+                conn, [(path, recursive, rank) for rank, (path, recursive) in enumerate(entries)]
+            )
+            rules = dbmod.get_all_folder_priorities(conn)
+            conn.close()
+
+            victims = self._compute_suggestions(rules)
             if not victims:
                 QMessageBox.information(
                     self,
                     "Suggest Delete",
-                    "No exact-duplicate group is fully contained in a single folder.",
+                    "Nothing to suggest: every group's top-priority folder already holds only one copy.",
                 )
                 return
             self.suggested_items = victims

@@ -1,17 +1,8 @@
 # Duplicate Finder
 
 A desktop app (PySide6) that scans a folder and all its subfolders for
-duplicate and near-duplicate media files and documents.
-
-## What it finds
-
-- **Exact duplicates**: files with identical content, detected via size
-  pre-filtering followed by hashing (blake2b), regardless of filename.
-- **Similar files**: files that aren't byte-identical but share the
-  attributes that matter for that file type — for photos/videos, the same
-  "date taken" and camera make/model; for documents, the same
-  author/creation date — even though the filename, and possibly the exact
-  bytes, differ.
+exact-duplicate files: files with identical content, detected via size
+pre-filtering followed by hashing (blake2b), regardless of filename.
 
 Groups can contain more than 2 files (e.g. 5 copies of the same photo).
 
@@ -25,10 +16,9 @@ Built to handle 100,000+ files:
 - Files are only hashed if they share a size with at least one other file
   (cheap `os.stat` pass first), and only fully hashed if a cheap partial
   hash (first+last 64KB) also matches.
-- Hashing and metadata/EXIF extraction run in a process pool across all
-  CPU cores.
+- Hashing runs in a process pool across all CPU cores.
 - Rescanning the same folder skips files whose size and modified time
-  haven't changed — their previous hash/metadata is reused.
+  haven't changed — their previous hash is reused.
 
 ## Setup
 
@@ -37,26 +27,15 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Pass `--exact-only` to restrict the app to exact-duplicate matches only
-(similar/near-duplicate groups are not shown or scanned into results) and
-to enable the **Suggest Delete** bulk-cleanup button:
-
-```
-python app.py --exact-only
-```
-
 ## Usage
 
 1. Browse to (or type) the folder to scan.
-2. Click **Start Scan**. Progress is shown per stage (walking, hashing,
-   reading attributes).
-3. Results appear as expandable groups — "Exact duplicates" or "Similar
-   (image/video/doc)" — each listing every file in that group with its
-   folder.
+2. Click **Start Scan**. Progress is shown per stage (walking, hashing).
+3. Results appear as expandable "Exact duplicates" groups, each listing
+   every file in that group with its folder.
 4. Double-click a file, or select it and click **Show Details**, to see
-   its full path, size, timestamps, hash, and extracted attributes
-   (EXIF date/camera, document author/created date, etc.).
-5. Use the **Show** dropdown and **Search** box to filter the results list.
+   its full path, size, timestamps, and hash.
+5. Use the **Search** box to filter the results list by name or path.
 6. Right-click a file for **Open Containing Folder** or **Delete File...**.
 
 ## Deleting files
@@ -75,26 +54,40 @@ or use the right-click menu). Safeguards:
 - A deleted file stays in the list, shown in red with strikethrough, until
   you rescan the folder — it isn't silently removed from view.
 
-## Suggest Delete (`--exact-only` mode)
+## Suggest Delete
 
-When launched with `--exact-only`, a **Suggest Delete** button appears.
-It targets exact-duplicate groups whose files all live in the same folder,
-and for each one picks a single file to remove: the one with the longest
-name, or — if names are the same length — the one that sorts last in
-natural (alphabetic + numeric) order. Groups spanning more than one folder,
-or where files live in different folders, are left alone.
+**Suggest Delete** is a bulk-cleanup action driven by a folder priority you
+set. It's a two-step action:
 
-It's a two-step action:
+1. **First press** opens **Set Folder Priority**, listing every folder that
+   holds a file in some duplicate group. Drag folders to rank them from
+   most important (top) to least important (bottom), and check
+   **Include subfolders** on a folder to also cover any subfolder under it —
+   including ones a later scan discovers that were never explicitly ranked
+   themselves. Press **Confirm** to lock in the ranking (or **Cancel** to
+   back out with nothing highlighted).
 
-1. **First press** computes the suggestions and highlights every file that
-   would be deleted in orange, without touching disk. Review the
-   highlighted files in the list.
+   For each duplicate group, the file(s) sitting in the highest-ranked
+   folder are kept; every file in a lower-ranked folder is suggested for
+   removal. If two or more files tie for the top rank (typically because
+   they're already in the very same folder), only one of them — the one
+   with the longest name, or the one that sorts last in natural
+   (alphabetic + numeric) order on a length tie — is added to the
+   suggestion, so exactly one keeper survives per group. A group whose
+   folders were never ranked is treated as one tied group, which reduces to
+   picking a single file to remove from it.
+
+   Suggested files are highlighted in **orange** — nothing is deleted yet.
+   Review the highlighted files in the list.
 2. **Second press** asks for confirmation (listing the files and total
    size) and, only if you confirm, moves exactly those files to the
    Recycle Bin. Declining the confirmation clears the highlight and
    suggests nothing further until you press the button again.
 
+Your folder ranking is cached (by folder path, in the same SQLite cache) so
+it's remembered automatically the next time those folders show up in a
+scan — you can always re-rank them in the dialog before confirming again.
+
 This is a separate action from the single-file **Delete File...** button
 and follows the same safety model: deletes go to the Recycle Bin via
-`send2trash`, and only one file per qualifying group is ever selected for
-removal, however many copies that group contains.
+`send2trash`.

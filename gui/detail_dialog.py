@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime
 
 from PySide6.QtWidgets import QDialog, QTextEdit, QVBoxLayout, QPushButton, QHBoxLayout
@@ -34,13 +33,6 @@ class DetailDialog(QDialog):
         text.setReadOnly(True)
         text.setFont(text.font())
 
-        meta = {}
-        if row.get("meta_json"):
-            try:
-                meta = json.loads(row["meta_json"])
-            except (TypeError, ValueError):
-                meta = {}
-
         lines = [
             f"Name:          {row.get('name')}",
             f"Folder:        {row.get('dir')}",
@@ -52,13 +44,7 @@ class DetailDialog(QDialog):
             "",
             f"Full hash:     {row.get('full_hash') or '(not computed)'}",
             f"Partial hash:  {row.get('partial_hash') or '(not computed)'}",
-            f"Similarity key:{' ' + row.get('signature') if row.get('signature') else ' (none)'}",
         ]
-        if meta:
-            lines.append("")
-            lines.append("Extracted attributes:")
-            for k, v in meta.items():
-                lines.append(f"  {k}: {v}")
         if row.get("error"):
             lines.append("")
             lines.append(f"Warning: {row['error']}")
