@@ -1,14 +1,14 @@
 """Orchestrates a scan: walk -> size-prune -> partial hash -> full hash ->
-metadata/signature extraction -> group results.
+group exact-duplicate results.
 
 Designed for large libraries (100k+ files):
   * Grouping/pruning is done with SQL GROUP BY on indexed columns instead of
     Python-side dict building.
-  * Hashing and metadata extraction only run on files that are actually
-    candidates (share a size with at least one other file), and only for
-    files whose cached value is missing/invalidated by db.upsert_walked_files.
-  * CPU-bound work (hashing, metadata parsing) is spread across a process
-    pool so it scales with available cores.
+  * Hashing only runs on files that are actually candidates (share a size
+    with at least one other file), and only for files whose cached value is
+    missing/invalidated by db.upsert_walked_files.
+  * CPU-bound hashing is spread across a process pool so it scales with
+    available cores.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import db as dbmod
-from . import hashing, metadata
+from . import hashing
 from .walker import walk
 
 ProgressCB = Callable[[str, int, int], None]
@@ -32,9 +32,7 @@ UPDATE_BATCH = 500
 
 @dataclass
 class DuplicateGroup:
-    kind: str  # "exact" or "similar"
-    category: str
-    key: str
+    key: str  # the shared full_hash
     files: list = field(default_factory=list)
 
 
@@ -103,16 +101,8 @@ def scan(
         conn.close()
         return {"cancelled": True}
 
-    # --- 4. Metadata / signature extraction for all media & docs ---
-    meta_candidates = dbmod.get_metadata_candidates(conn, root)
-    _run_metadata_pool(meta_candidates, max_workers, cancelled, conn, progress_cb)
-    if cancelled():
-        conn.close()
-        return {"cancelled": True}
-
     total_files = dbmod.count_files(conn, root)
     exact_hashes = dbmod.get_exact_group_hashes(conn, root)
-    sig_groups = dbmod.get_signature_groups(conn, root)
 
     conn.close()
     progress_cb("done", 1, 1)
@@ -121,7 +111,6 @@ def scan(
         "total_files": total_files,
         "removed": removed,
         "exact_group_count": len(exact_hashes),
-        "similar_group_count": len(sig_groups),
         "cancelled": False,
     }
 
@@ -163,35 +152,6 @@ def _run_pool(candidates, worker_fn, max_workers, cancelled, update_fn, progress
         update_fn(pending)
 
 
-def _run_metadata_pool(candidates, max_workers, cancelled, conn, progress_cb):
-    if not candidates:
-        progress_cb("metadata", 0, 0)
-        return
-    total = len(candidates)
-    done = 0
-    pending: list = []
-    last_emit = time.monotonic()
-    chunksize = _adaptive_chunksize(total, max_workers, cap=32)
-    with ProcessPoolExecutor(max_workers=max_workers) as pool:
-        futures = pool.map(
-            metadata.extract, [p for p, _c in candidates], [c for _p, c in candidates], chunksize=chunksize
-        )
-        for result in futures:
-            pending.append(result)
-            done += 1
-            if len(pending) >= UPDATE_BATCH:
-                dbmod.update_metadata(conn, pending)
-                pending = []
-            now = time.monotonic()
-            if done % 50 == 0 or done == total or now - last_emit >= 0.5:
-                progress_cb("metadata", done, total)
-                last_emit = now
-            if cancelled():
-                break
-    if pending:
-        dbmod.update_metadata(conn, pending)
-
-
 def get_results(root: str, db_path: Optional[Path] = None) -> list[DuplicateGroup]:
     """Load grouped results for display. Called from the GUI after a scan."""
     db_path = db_path or dbmod.default_db_path()
@@ -203,14 +163,8 @@ def get_results(root: str, db_path: Optional[Path] = None) -> list[DuplicateGrou
     for full_hash in dbmod.get_exact_group_hashes(conn, root):
         rows = dbmod.get_files_by_full_hash(conn, root, full_hash)
         if len(rows) > 1:
-            groups.append(DuplicateGroup(kind="exact", category=rows[0]["category"], key=full_hash, files=rows))
-
-    for category, signature in dbmod.get_signature_groups(conn, root):
-        rows = dbmod.get_files_by_signature(conn, root, category, signature)
-        hashes = {r["full_hash"] for r in rows}
-        if len(rows) > 1 and (len(hashes) > 1 or None in hashes):
-            groups.append(DuplicateGroup(kind="similar", category=category, key=signature, files=rows))
+            groups.append(DuplicateGroup(key=full_hash, files=rows))
 
     conn.close()
-    groups.sort(key=lambda g: (-sum(r["size"] for r in g.files), g.kind))
+    groups.sort(key=lambda g: -sum(r["size"] for r in g.files))
     return groups

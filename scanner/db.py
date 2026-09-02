@@ -3,7 +3,7 @@
 Using SQLite (instead of in-memory Python structures) lets us handle 100k+
 files without keeping everything in RAM twice, gives us fast set-based
 GROUP BY queries for duplicate detection, and lets rescans of an unchanged
-folder skip re-hashing/re-extracting metadata entirely.
+folder skip re-hashing entirely.
 """
 from __future__ import annotations
 
@@ -24,8 +24,6 @@ CREATE TABLE IF NOT EXISTS files (
     ctime REAL,
     partial_hash TEXT,
     full_hash TEXT,
-    meta_json TEXT,
-    signature TEXT,
     error TEXT,
     stale INTEGER NOT NULL DEFAULT 0
 );
@@ -33,7 +31,17 @@ CREATE INDEX IF NOT EXISTS idx_files_root ON files(root);
 CREATE INDEX IF NOT EXISTS idx_files_root_size ON files(root, category, size);
 CREATE INDEX IF NOT EXISTS idx_files_root_partial ON files(root, size, partial_hash);
 CREATE INDEX IF NOT EXISTS idx_files_root_fullhash ON files(root, full_hash);
-CREATE INDEX IF NOT EXISTS idx_files_root_signature ON files(root, category, signature);
+
+-- Remembers, per folder, the user's Suggest Delete keep/remove priority so
+-- it can be reapplied automatically the next time that folder shows up in a
+-- scan. `recursive` extends a folder's rank to every path nested under it,
+-- covering subfolders discovered in a later scan that were never explicitly
+-- ranked themselves.
+CREATE TABLE IF NOT EXISTS folder_priority (
+    path TEXT PRIMARY KEY,
+    recursive INTEGER NOT NULL DEFAULT 0,
+    rank INTEGER NOT NULL
+);
 """
 
 
@@ -69,7 +77,7 @@ def upsert_walked_files(conn: sqlite3.Connection, root: str, records: Sequence[t
 
     Bulk upsert via a temp staging table so the diff/merge is done in one
     set-based SQL statement instead of one Python round trip per file.
-    Unchanged files (same size+mtime) keep their cached hash/metadata.
+    Unchanged files (same size+mtime) keep their cached hash.
     """
     if not records:
         return
@@ -104,10 +112,6 @@ def upsert_walked_files(conn: sqlite3.Connection, root: str, records: Sequence[t
                                  THEN files.partial_hash ELSE NULL END,
             full_hash = CASE WHEN files.size = scan_seen.size AND files.mtime = scan_seen.mtime
                               THEN files.full_hash ELSE NULL END,
-            meta_json = CASE WHEN files.size = scan_seen.size AND files.mtime = scan_seen.mtime
-                              THEN files.meta_json ELSE NULL END,
-            signature = CASE WHEN files.size = scan_seen.size AND files.mtime = scan_seen.mtime
-                              THEN files.signature ELSE NULL END,
             error = CASE WHEN files.size = scan_seen.size AND files.mtime = scan_seen.mtime
                          THEN files.error ELSE NULL END
         FROM scan_seen
@@ -175,25 +179,6 @@ def update_full_hashes(conn: sqlite3.Connection, rows: Iterable[tuple[str, str |
     conn.commit()
 
 
-def get_metadata_candidates(conn: sqlite3.Connection, root: str) -> list[tuple[str, str]]:
-    cur = conn.execute(
-        """
-        SELECT path, category FROM files
-        WHERE root = ? AND meta_json IS NULL AND category IN ('image', 'video', 'doc')
-        """,
-        (root,),
-    )
-    return cur.fetchall()
-
-
-def update_metadata(conn: sqlite3.Connection, rows: Iterable[tuple[str, str, str | None, str | None]]) -> None:
-    conn.executemany(
-        "UPDATE files SET meta_json = ?, signature = ?, error = COALESCE(?, error) WHERE path = ?",
-        [(meta_json, sig, err, p) for p, meta_json, sig, err in rows],
-    )
-    conn.commit()
-
-
 def get_exact_group_hashes(conn: sqlite3.Connection, root: str) -> list[str]:
     cur = conn.execute(
         """
@@ -214,27 +199,6 @@ def get_files_by_full_hash(conn: sqlite3.Connection, root: str, full_hash: str) 
     return cur.fetchall()
 
 
-def get_signature_groups(conn: sqlite3.Connection, root: str) -> list[tuple[str, str]]:
-    cur = conn.execute(
-        """
-        SELECT category, signature FROM files
-        WHERE root = ? AND signature IS NOT NULL
-        GROUP BY category, signature HAVING COUNT(*) > 1
-        """,
-        (root,),
-    )
-    return cur.fetchall()
-
-
-def get_files_by_signature(conn: sqlite3.Connection, root: str, category: str, signature: str) -> list[sqlite3.Row]:
-    conn.row_factory = sqlite3.Row
-    cur = conn.execute(
-        "SELECT * FROM files WHERE root = ? AND category = ? AND signature = ? ORDER BY path",
-        (root, category, signature),
-    )
-    return cur.fetchall()
-
-
 def get_file(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
     conn.row_factory = sqlite3.Row
     cur = conn.execute("SELECT * FROM files WHERE path = ?", (path,))
@@ -244,3 +208,22 @@ def get_file(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
 def count_files(conn: sqlite3.Connection, root: str) -> int:
     cur = conn.execute("SELECT COUNT(*) FROM files WHERE root = ?", (root,))
     return cur.fetchone()[0]
+
+
+def get_all_folder_priorities(conn: sqlite3.Connection) -> list[tuple[str, bool, int]]:
+    """All cached folder-priority rules, as (path, recursive, rank)."""
+    cur = conn.execute("SELECT path, recursive, rank FROM folder_priority")
+    return [(path, bool(recursive), rank) for path, recursive, rank in cur.fetchall()]
+
+
+def save_folder_priorities(conn: sqlite3.Connection, entries: Sequence[tuple[str, bool, int]]) -> None:
+    """Upserts (path, recursive, rank) rules. Only touches the given paths --
+    priorities cached for other folder trees are left alone."""
+    conn.executemany(
+        """
+        INSERT INTO folder_priority (path, recursive, rank) VALUES (?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET recursive = excluded.recursive, rank = excluded.rank
+        """,
+        [(path, int(recursive), rank) for path, recursive, rank in entries],
+    )
+    conn.commit()
