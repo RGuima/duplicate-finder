@@ -60,12 +60,24 @@ or use the right-click menu). Safeguards:
 set. It's a two-step action:
 
 1. **First press** opens **Set Folder Priority**, listing every folder that
-   holds a file in some duplicate group. Drag folders to rank them from
-   most important (top) to least important (bottom), and check
-   **Include subfolders** on a folder to also cover any subfolder under it —
-   including ones a later scan discovers that were never explicitly ranked
-   themselves. Press **Confirm** to lock in the ranking (or **Cancel** to
-   back out with nothing highlighted).
+   holds a file in some duplicate group. Rank folders from most important
+   (top) to least important (bottom) using whichever is fastest:
+   - **Drag and drop** one folder, or a multi-selection of several
+     (Ctrl/Shift-click, or a drag-selection box), to a new spot in one move.
+   - **Move to Top / Move Up / Move Down / Move to Bottom** buttons act on
+     the whole current selection as a block, so you can bulk-move several
+     folders at once instead of one row at a time.
+   - Keyboard shortcuts: **Alt+Up** / **Alt+Down** to nudge the selection,
+     **Ctrl+Home** / **Ctrl+End** to send it to the top or bottom.
+   - A **Find** box highlights and jumps to folders matching what you type,
+     useful once the list gets long.
+   - Each row is numbered with its current rank so the order is always
+     visible at a glance.
+
+   Check **Include subfolders** on a folder to also cover any subfolder
+   under it — including ones a later scan discovers that were never
+   explicitly ranked themselves. Press **Confirm** to lock in the ranking
+   (or **Cancel** to back out with nothing highlighted).
 
    For each duplicate group, the file(s) sitting in the highest-ranked
    folder are kept; every file in a lower-ranked folder is suggested for
